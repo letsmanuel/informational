@@ -11,22 +11,22 @@
         font-family: Arial, sans-serif;
         background: #0b0f14;
         color: #e6edf3;
-        line-height: 1.6;
+        line-height: 1.7;
     }
 
     header {
-        padding: 30px;
+        padding: 40px;
         background: #111826;
         border-bottom: 1px solid #1f2a37;
     }
 
     header h1 {
         margin: 0;
-        font-size: 26px;
+        font-size: 28px;
     }
 
     header p {
-        margin: 5px 0 0;
+        margin-top: 8px;
         color: #9ca3af;
     }
 
@@ -37,49 +37,49 @@
     }
 
     h2 {
+        margin-top: 50px;
         border-bottom: 1px solid #1f2a37;
         padding-bottom: 6px;
-        margin-top: 40px;
     }
 
-    pre {
-        background: #111826;
-        padding: 12px;
-        border-radius: 6px;
-        overflow-x: auto;
-        border: 1px solid #1f2a37;
+    .step {
+        margin: 40px 0;
+        padding: 18px;
+        background: #0f1722;
+        border-left: 4px solid #3b82f6;
+        border-radius: 8px;
     }
 
-    .tag {
-        display: inline-block;
-        background: #1f2a37;
-        padding: 4px 10px;
-        border-radius: 4px;
-        font-size: 12px;
-        margin-bottom: 10px;
-    }
-
-    .img {
-        margin: 20px 0;
+    .step h3 {
+        margin-top: 0;
     }
 
     .img img {
         width: 100%;
         border-radius: 8px;
         border: 1px solid #1f2a37;
+        margin-top: 12px;
     }
 
-    .callout {
-        background: #0f1722;
-        border-left: 4px solid #3b82f6;
+    pre {
+        background: #111826;
         padding: 12px;
-        margin: 15px 0;
         border-radius: 6px;
+        border: 1px solid #1f2a37;
+        overflow-x: auto;
+        margin-top: 10px;
+    }
+
+    .intro {
+        background: #0f1722;
+        padding: 18px;
+        border-radius: 8px;
+        border: 1px solid #1f2a37;
     }
 
     footer {
-        margin-top: 60px;
-        padding: 20px;
+        margin-top: 70px;
+        padding: 25px;
         text-align: center;
         color: #6b7280;
         border-top: 1px solid #1f2a37;
@@ -90,30 +90,72 @@
 <body>
 
 <header>
-    <h1>Incident Postmortem: Full VPS CPU Saturation</h1>
-    <p>05 May 2026 | Severity: SEV-1 | Host: ubuntu-4gb-nbg1-4</p>
+    <h1>Incident Postmortem: VPS CPU Saturation</h1>
+    <p>05 May 2026 | Host: ubuntu-4gb-nbg1-4 | Severity: SEV-1</p>
 </header>
 
 <div class="container">
 
-<div class="tag">Production Incident Report</div>
+<h2>Overview</h2>
 
-<h2>What happened</h2>
-
-<div class="callout">
-A single Python service running a Discord bot entered a tight error loop caused by SQLite write contention.  
-This loop rapidly consumed all available CPU resources, starving every other system process.
+<div class="intro">
+A single process caused sustained full CPU saturation on a small VPS instance. The system did not crash, but became unresponsive due to complete scheduler starvation across all services.
 </div>
 
 <p>
-The affected service (<code>anticheat-bot</code>) repeatedly attempted database writes using SQLite.  
-Due to concurrent access, SQLite returned <code>database is locked</code> errors.
-Instead of backing off, the bot continuously retried the operation.
+The issue originated from a Python Discord bot using SQLite for persistence. Under concurrent write load, the database entered a locked state. The application did not implement backoff or throttling, resulting in a continuous retry loop inside the event handler.
 </p>
 
 <p>
-This created a <b>CPU spin condition</b> — a state where the process never sleeps, never yields, and continuously executes retries at maximum speed.
+At peak load, both virtual CPUs were fully saturated (200% combined utilization). During this period, external monitoring tools triggered alerts and staff were paged due to multiple service failures and lost health checks.
 </p>
+
+<h2>Timeline</h2>
+
+<div class="step">
+    <h3>System baseline</h3>
+    <p>System was operating normally with stable load and no visible resource pressure.</p>
+
+    <div class="img">
+        <img src="./05may2026/load.jpeg" alt="Baseline load">
+    </div>
+</div>
+
+<div class="step">
+    <h3>Load begins increasing</h3>
+    <p>Discord bot activity increases. Database write frequency rises.</p>
+</div>
+
+<div class="step">
+    <h3>CPU spike starts</h3>
+    <p>Repeated SQLite lock errors begin triggering a tight retry loop in the bot process.</p>
+
+    <div class="img">
+        <img src="./05may2026/cpu.jpeg" alt="CPU spike">
+    </div>
+</div>
+
+<div class="step">
+    <h3>Memory pressure increases</h3>
+    <p>System memory usage rises due to sustained execution pressure.</p>
+
+    <div class="img">
+        <img src="./05may2026/memory.jpeg" alt="Memory usage">
+    </div>
+</div>
+
+<div class="step">
+    <h3>Disk and database contention</h3>
+    <p>SQLite enters locked state under concurrent access, triggering repeated failures.</p>
+
+    <div class="img">
+        <img src="./05may2026/disk.jpeg" alt="Disk activity">
+    </div>
+</div>
+
+<div class="step">
+    <h3>CPU saturation and system starvation</h3>
+    <p>Both vCPUs reach full utilization. System services stop receiving scheduling time.</p>
 
 <pre>
 sqlite3.OperationalError: database is locked
@@ -121,23 +163,11 @@ discord.client: Ignoring exception in on_message
 await db.commit()
 </pre>
 
-
-<h2>Why the system collapsed</h2>
-
-<p>
-Once the Python process saturated both vCPUs, the entire system began to degrade:
-</p>
-
-<ul>
-    <li>SSH stopped receiving CPU time → connection freeze</li>
-    <li>Docker daemon could not respond → socket failures</li>
-    <li>containerd lost RPC synchronization</li>
-    <li>system monitoring stopped reporting data</li>
-</ul>
-
-<div class="callout">
-This was not a crash. The system remained running but became fully CPU-starved.
 </div>
+
+<div class="step">
+    <h3>System-wide failure</h3>
+    <p>Docker, SSH, and monitoring systems begin failing due to CPU starvation.</p>
 
 <pre>
 dockerd: write unix /run/docker.sock: broken pipe
@@ -145,11 +175,20 @@ containerd: ttrpc received message on inactive stream
 Health check timed out starting container health check
 </pre>
 
+</div>
+
+<div class="step">
+    <h3>Alerting and escalation</h3>
+    <p>
+    At peak CPU usage (200%), external monitoring systems detected service outages and triggered alerts.
+    On-call staff were paged due to simultaneous failures across multiple services and missing health checks.
+    </p>
+</div>
 
 <h2>Root cause</h2>
 
 <p>
-The root cause was a Python process:
+The failing process was:
 </p>
 
 <pre>
@@ -158,91 +197,29 @@ python[3640301]
 </pre>
 
 <p>
-Inside this process:
+The application repeatedly processed Discord events and attempted SQLite writes. When the database locked, the process retried immediately without delay, creating a continuous CPU-bound loop.
 </p>
 
-<ul>
-    <li>Discord event loop triggered high-frequency <code>on_message</code> events</li>
-    <li>Each event attempted SQLite write</li>
-    <li>SQLite locked due to concurrent writes</li>
-    <li>Exception handling did not include delay or backoff</li>
-    <li>Loop repeated continuously at maximum CPU speed</li>
-</ul>
+<p>
+This resulted in a sustained spin condition that consumed all available CPU resources.
+</p>
 
-
-<h2>Impact summary</h2>
+<h2>Impact</h2>
 
 <ul>
-    <li>Full CPU saturation (100% on both vCPUs)</li>
-    <li>SSH unresponsive</li>
-    <li>Docker and container runtime degraded</li>
-    <li>Monitoring gaps (Beszel + Hetzner dashboard unavailable)</li>
-    <li>All hosted services impacted</li>
+    <li>Full CPU saturation (200% across 2 vCPUs)</li>
+    <li>SSH became unresponsive</li>
+    <li>Docker daemon and container runtime degraded</li>
+    <li>Monitoring systems failed or showed gaps</li>
+    <li>External alerting systems paged staff during peak outage</li>
 </ul>
-
-
-<h2>System behavior under load</h2>
-
-<div class="callout">
-When CPU is fully saturated, Linux does not “fail” — it stops scheduling time for other processes.
-This creates the illusion of a crash while the system is technically still running.
-</div>
-
-
-<h2>Evidence (visuals)</h2>
-
-<p>These graphs show the system state during and after the incident.</p>
-
-<h3>CPU saturation</h3>
-<div class="img">
-    <img src="./05may2026/cpu.jpeg" alt="CPU spike">
-</div>
-
-<h3>System load</h3>
-<div class="img">
-    <img src="./05may2026/load.jpeg" alt="Load average">
-</div>
-
-<h3>Memory usage</h3>
-<div class="img">
-    <img src="./05may2026/memory.jpeg" alt="Memory usage">
-</div>
-
-<h3>Disk activity</h3>
-<div class="img">
-    <img src="./05may2026/disk.jpeg" alt="Disk usage">
-</div>
-
-
-<h2>Resolution</h2>
-
-<ul>
-    <li>Forced VPS restart</li>
-    <li>Process state lost due to system starvation</li>
-</ul>
-
-
-<h2>Preventive actions</h2>
-
-<ul>
-    <li>Replace SQLite with PostgreSQL or queued writes</li>
-    <li>Add retry backoff on database lock errors</li>
-    <li>Throttle Discord event handling</li>
-    <li>Introduce CPU limits (cgroups / Docker limits)</li>
-    <li>Improve service isolation for bot workloads</li>
-</ul>
-
 
 <h2>Conclusion</h2>
 
 <p>
-The incident was caused by a single Python service entering an unbounded retry loop due to SQLite contention.  
-This resulted in full CPU starvation, cascading system degradation, and total loss of service responsiveness.
+A single unbounded retry loop in a user-space application was sufficient to fully saturate CPU resources on the host.
+The system remained running but effectively unusable due to scheduler starvation.
 </p>
-
-<div class="callout">
-Key lesson: a single unbounded async loop can bring down an entire VPS without crashing it.
-</div>
 
 <footer>
 Incident report generated for postmortem documentation
