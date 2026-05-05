@@ -1,0 +1,254 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0"/>
+<title>Incident Postmortem - 05 May 2026</title>
+
+<style>
+    body {
+        margin: 0;
+        font-family: Arial, sans-serif;
+        background: #0b0f14;
+        color: #e6edf3;
+        line-height: 1.6;
+    }
+
+    header {
+        padding: 30px;
+        background: #111826;
+        border-bottom: 1px solid #1f2a37;
+    }
+
+    header h1 {
+        margin: 0;
+        font-size: 26px;
+    }
+
+    header p {
+        margin: 5px 0 0;
+        color: #9ca3af;
+    }
+
+    .container {
+        max-width: 900px;
+        margin: auto;
+        padding: 30px;
+    }
+
+    h2 {
+        border-bottom: 1px solid #1f2a37;
+        padding-bottom: 6px;
+        margin-top: 40px;
+    }
+
+    pre {
+        background: #111826;
+        padding: 12px;
+        border-radius: 6px;
+        overflow-x: auto;
+        border: 1px solid #1f2a37;
+    }
+
+    .tag {
+        display: inline-block;
+        background: #1f2a37;
+        padding: 4px 10px;
+        border-radius: 4px;
+        font-size: 12px;
+        margin-bottom: 10px;
+    }
+
+    .img {
+        margin: 20px 0;
+    }
+
+    .img img {
+        width: 100%;
+        border-radius: 8px;
+        border: 1px solid #1f2a37;
+    }
+
+    .callout {
+        background: #0f1722;
+        border-left: 4px solid #3b82f6;
+        padding: 12px;
+        margin: 15px 0;
+        border-radius: 6px;
+    }
+
+    footer {
+        margin-top: 60px;
+        padding: 20px;
+        text-align: center;
+        color: #6b7280;
+        border-top: 1px solid #1f2a37;
+    }
+</style>
+</head>
+
+<body>
+
+<header>
+    <h1>Incident Postmortem: Full VPS CPU Saturation</h1>
+    <p>05 May 2026 | Severity: SEV-1 | Host: ubuntu-4gb-nbg1-4</p>
+</header>
+
+<div class="container">
+
+<div class="tag">Production Incident Report</div>
+
+<h2>What happened</h2>
+
+<div class="callout">
+A single Python service running a Discord bot entered a tight error loop caused by SQLite write contention.  
+This loop rapidly consumed all available CPU resources, starving every other system process.
+</div>
+
+<p>
+The affected service (<code>anticheat-bot</code>) repeatedly attempted database writes using SQLite.  
+Due to concurrent access, SQLite returned <code>database is locked</code> errors.
+Instead of backing off, the bot continuously retried the operation.
+</p>
+
+<p>
+This created a <b>CPU spin condition</b> — a state where the process never sleeps, never yields, and continuously executes retries at maximum speed.
+</p>
+
+<pre>
+sqlite3.OperationalError: database is locked
+discord.client: Ignoring exception in on_message
+await db.commit()
+</pre>
+
+
+<h2>Why the system collapsed</h2>
+
+<p>
+Once the Python process saturated both vCPUs, the entire system began to degrade:
+</p>
+
+<ul>
+    <li>SSH stopped receiving CPU time → connection freeze</li>
+    <li>Docker daemon could not respond → socket failures</li>
+    <li>containerd lost RPC synchronization</li>
+    <li>system monitoring stopped reporting data</li>
+</ul>
+
+<div class="callout">
+This was not a crash. The system remained running but became fully CPU-starved.
+</div>
+
+<pre>
+dockerd: write unix /run/docker.sock: broken pipe
+containerd: ttrpc received message on inactive stream
+Health check timed out starting container health check
+</pre>
+
+
+<h2>Root cause</h2>
+
+<p>
+The root cause was a Python process:
+</p>
+
+<pre>
+python[3640301]
+/opt/anticheat-bot/
+</pre>
+
+<p>
+Inside this process:
+</p>
+
+<ul>
+    <li>Discord event loop triggered high-frequency <code>on_message</code> events</li>
+    <li>Each event attempted SQLite write</li>
+    <li>SQLite locked due to concurrent writes</li>
+    <li>Exception handling did not include delay or backoff</li>
+    <li>Loop repeated continuously at maximum CPU speed</li>
+</ul>
+
+
+<h2>Impact summary</h2>
+
+<ul>
+    <li>Full CPU saturation (100% on both vCPUs)</li>
+    <li>SSH unresponsive</li>
+    <li>Docker and container runtime degraded</li>
+    <li>Monitoring gaps (Beszel + Hetzner dashboard unavailable)</li>
+    <li>All hosted services impacted</li>
+</ul>
+
+
+<h2>System behavior under load</h2>
+
+<div class="callout">
+When CPU is fully saturated, Linux does not “fail” — it stops scheduling time for other processes.
+This creates the illusion of a crash while the system is technically still running.
+</div>
+
+
+<h2>Evidence (visuals)</h2>
+
+<p>These graphs show the system state during and after the incident.</p>
+
+<h3>CPU saturation</h3>
+<div class="img">
+    <img src="./05may2026/cpu.jpeg" alt="CPU spike">
+</div>
+
+<h3>System load</h3>
+<div class="img">
+    <img src="./05may2026/load.jpeg" alt="Load average">
+</div>
+
+<h3>Memory usage</h3>
+<div class="img">
+    <img src="./05may2026/memory.jpeg" alt="Memory usage">
+</div>
+
+<h3>Disk activity</h3>
+<div class="img">
+    <img src="./05may2026/disk.jpeg" alt="Disk usage">
+</div>
+
+
+<h2>Resolution</h2>
+
+<ul>
+    <li>Forced VPS restart</li>
+    <li>Process state lost due to system starvation</li>
+</ul>
+
+
+<h2>Preventive actions</h2>
+
+<ul>
+    <li>Replace SQLite with PostgreSQL or queued writes</li>
+    <li>Add retry backoff on database lock errors</li>
+    <li>Throttle Discord event handling</li>
+    <li>Introduce CPU limits (cgroups / Docker limits)</li>
+    <li>Improve service isolation for bot workloads</li>
+</ul>
+
+
+<h2>Conclusion</h2>
+
+<p>
+The incident was caused by a single Python service entering an unbounded retry loop due to SQLite contention.  
+This resulted in full CPU starvation, cascading system degradation, and total loss of service responsiveness.
+</p>
+
+<div class="callout">
+Key lesson: a single unbounded async loop can bring down an entire VPS without crashing it.
+</div>
+
+<footer>
+Incident report generated for postmortem documentation
+</footer>
+
+</div>
+
+</body>
+</html>
